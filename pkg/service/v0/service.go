@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/blevesearch/bleve"
 	"github.com/blevesearch/bleve/analysis/analyzer/keyword"
@@ -23,7 +24,12 @@ type BleveDocument struct {
 	Table    string                  `json:"table"`
 }
 
-// New returns a new instance of Service
+var (
+	// DefaultIndex is the default name for an index.
+	DefaultIndex = "index.bleve"
+)
+
+// New returns a new Service.
 func New(opts ...Option) (s *Service, err error) {
 	options := newOptions(opts...)
 	logger := options.Logger
@@ -49,12 +55,12 @@ func New(opts ...Option) (s *Service, err error) {
 	indexMapping.DefaultAnalyzer = keyword.Name
 
 	s = &Service{
-		id:     cfg.GRPC.Namespace + "." + "store",
+		id:     strings.Join([]string{cfg.GRPC.Namespace, "store"}, "."),
 		log:    logger,
 		Config: cfg,
 	}
 
-	indexDir := filepath.Join(cfg.Datapath, "index.bleve")
+	indexDir := filepath.Join(cfg.Datapath, DefaultIndex)
 	// for now recreate index on every start
 	if err = os.RemoveAll(indexDir); err != nil {
 		return nil, err
@@ -97,7 +103,7 @@ func (s *Service) Read(c context.Context, rreq *proto.ReadRequest, rres *proto.R
 		return nil
 	}
 
-	s.log.Info().Interface("requeest", rreq).Msg("read request")
+	s.log.Info().Interface("request", rreq).Msg("read request")
 	if rreq.Options.Where != nil {
 		// build bleve query
 		// execute search
@@ -249,84 +255,53 @@ func getID(database string, table string, key string) string {
 }
 
 func (s Service) indexRecords(recordsDir string) (err error) {
+	dbPath := s.Config.Datapath + "/databases"
+	return filepath.Walk(recordsDir, func(path string, info os.FileInfo, err error) error {
+		if info.Mode().IsRegular() {
+			parts := strings.Split(strings.TrimPrefix(filepath.Dir(path), dbPath), "/")
 
-	// TODO use filepath.Walk to clean up code
-	rh, err := os.Open(recordsDir)
+			info := struct {
+				database string
+				table    string
+			}{
+				parts[1],
+				parts[2],
+			}
+
+			id := getID(info.database, info.table, filepath.Base(path))
+			rec := &proto.Record{}
+
+			if err := unmarshalRecord(path, rec); err != nil {
+				return err
+			}
+
+			doc := BleveDocument{
+				Metadata: rec.Metadata,
+				Database: info.database,
+				Table:    info.table,
+			}
+
+			// index record
+			if err := s.index.Index(id, doc); err != nil {
+				s.log.Error().Err(err).Interface("document", doc).Str("id", id).Msg("could not index record metadata")
+				return filepath.SkipDir
+			}
+
+			s.log.Debug().Str("id", id).Msg("indexed record")
+		}
+		return nil
+	})
+}
+
+// unmarshalRecord reads the contents of `path` as a proto.Record and unmarshals them onto `rec`, hence the pointer.
+func unmarshalRecord(path string, rec *proto.Record) error {
+	data, err := ioutil.ReadFile(path)
 	if err != nil {
-		return merrors.InternalServerError(s.id, "could not open database directory")
-	}
-	defer rh.Close()
-
-	dbs, err := rh.Readdirnames(0)
-	if err != nil {
-		return merrors.InternalServerError(s.id, "could not read databases directory")
+		return err
 	}
 
-	for i := range dbs {
-		tp := filepath.Join(s.Config.Datapath, "databases", dbs[i])
-		th, err := os.Open(tp)
-		if err != nil {
-			s.log.Error().Err(err).Str("database", dbs[i]).Msg("could not open database directory")
-			continue
-		}
-		defer th.Close()
-
-		tables, err := th.Readdirnames(0)
-		if err != nil {
-			s.log.Error().Err(err).Str("database", dbs[i]).Msg("could not read database directory")
-			continue
-		}
-
-		for j := range tables {
-
-			tp := filepath.Join(s.Config.Datapath, "databases", dbs[i], tables[j])
-			kh, err := os.Open(tp)
-			if err != nil {
-				s.log.Error().Err(err).Str("database", dbs[i]).Str("table", tables[i]).Msg("could not open table directory")
-				continue
-			}
-			defer kh.Close()
-
-			keys, err := kh.Readdirnames(0)
-			if err != nil {
-				s.log.Error().Err(err).Str("database", dbs[i]).Str("table", tables[i]).Msg("could not read table directory")
-				continue
-			}
-
-			for k := range keys {
-
-				id := getID(dbs[i], tables[j], keys[k])
-				kp := filepath.Join(s.Config.Datapath, "databases", id)
-
-				// read record
-				var data []byte
-				rec := &proto.Record{}
-				data, err = ioutil.ReadFile(kp)
-				if err != nil {
-					s.log.Error().Err(err).Str("id", id).Msg("could not read record")
-					continue
-				}
-
-				if err = protojson.Unmarshal(data, rec); err != nil {
-					s.log.Error().Err(err).Str("id", id).Msg("could not unmarshal record")
-					continue
-				}
-
-				// index record
-				doc := BleveDocument{
-					Metadata: rec.Metadata,
-					Database: dbs[i],
-					Table:    tables[j],
-				}
-				if err := s.index.Index(id, doc); err != nil {
-					s.log.Error().Err(err).Interface("document", doc).Str("id", id).Msg("could not index record metadata")
-					continue
-				}
-
-				s.log.Debug().Str("id", id).Msg("indexed record")
-			}
-		}
+	if err = protojson.Unmarshal(data, rec); err != nil {
+		return err
 	}
-
-	return
+	return nil
 }
